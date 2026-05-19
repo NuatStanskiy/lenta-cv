@@ -8,19 +8,22 @@ ENV:
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 from pathlib import Path
 
 import httpx
 from fastapi import FastAPI, File, HTTPException, UploadFile
-from fastapi.responses import JSONResponse, Response
+from fastapi.responses import JSONResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 
 PIPELINE_URL = os.getenv("PIPELINE_API_URL", "http://localhost:7860").rstrip("/")
 PIPELINE_KEY = os.getenv("PIPELINE_API_KEY") or ""
 TIMEOUT = float(os.getenv("REQUEST_TIMEOUT", "1800"))
 RETRY_DELAY = float(os.getenv("RETRY_DELAY", "3"))
-TRANSIENT_ERRORS = (httpx.ConnectError, httpx.ReadError, httpx.RemoteProtocolError)
+# Catch every httpx error: SSH tunnels die mid-stream all the time; we want the browser
+# to see a clean NDJSON {"event":"error"} line instead of a 502.
+TRANSIENT_ERRORS = (httpx.HTTPError,)
 
 app = FastAPI(title="Price-tag pipeline UI")
 
@@ -65,7 +68,68 @@ async def _forward(endpoint: str, file: UploadFile) -> httpx.Response:
 
 
 @app.post("/api/process")
+async def process_stream(file: UploadFile = File(...)) -> StreamingResponse:
+    """Stream the pipeline NDJSON to the browser so UI can show per-event progress."""
+    payload = await file.read()
+    fname = file.filename or "upload.bin"
+    ctype = file.content_type or "application/octet-stream"
+
+    async def gen():
+        client = httpx.AsyncClient(timeout=TIMEOUT)
+        # if the tunnel dies mid-stream we must still emit a well-formed NDJSON line so the
+        # frontend sees error: ... instead of a generic 'Failed to fetch'.
+        emitted_done = False
+        try:
+            async with client.stream(
+                "POST",
+                f"{PIPELINE_URL}/process_stream",
+                files={"file": (fname, payload, ctype)},
+                headers=_headers(),
+            ) as r:
+                if r.status_code != 200:
+                    body = await r.aread()
+                    yield (json.dumps({
+                        "event": "error",
+                        "error": f"pipeline returned {r.status_code}",
+                        "raw": body.decode("utf-8", "replace")[:2000],
+                    }) + "\n").encode("utf-8")
+                    return
+                buffer = b""
+                async for chunk in r.aiter_raw():
+                    buffer += chunk
+                    # advance to last full line to know if we already passed "done"
+                    while b"\n" in buffer:
+                        line, _, buffer = buffer.partition(b"\n")
+                        if b'"event": "done"' in line or b'"event":"done"' in line:
+                            emitted_done = True
+                        yield line + b"\n"
+                if buffer:
+                    yield buffer
+        except (TRANSIENT_ERRORS) as exc:
+            if not emitted_done:
+                yield (json.dumps({
+                    "event": "error",
+                    "error": f"pipeline connection dropped: {type(exc).__name__}: {exc}",
+                }) + "\n").encode("utf-8")
+        except Exception as exc:  # last-resort guard so we never return 502
+            if not emitted_done:
+                yield (json.dumps({
+                    "event": "error",
+                    "error": f"proxy error: {type(exc).__name__}: {exc}",
+                }) + "\n").encode("utf-8")
+        finally:
+            await client.aclose()
+
+    return StreamingResponse(
+        gen(),
+        media_type="application/x-ndjson",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
+
+
+@app.post("/api/process_json")
 async def process_json(file: UploadFile = File(...)) -> JSONResponse:
+    """Synchronous fallback for clients that don't speak NDJSON streaming."""
     try:
         r = await _forward("/process_json", file)
     except httpx.HTTPError as exc:

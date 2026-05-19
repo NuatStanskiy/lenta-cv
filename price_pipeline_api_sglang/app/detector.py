@@ -28,23 +28,48 @@ class PriceTagDetector:
         self.corrector = FisheyeCorrector(settings)
         self._tracker_config_path = self._write_tracker_config()
 
-    def process_image(self, image_bgr: np.ndarray) -> list[CropCandidate]:
+    def process_image(self, image_bgr: np.ndarray, progress=None) -> list[CropCandidate]:
         self.model.predictor = None  # drop leftover tracker state from any prior video run
+        if progress:
+            progress({"event": "detect_start", "frames_total": 1, "kind": "image"})
         frame = self.corrector.process(image_bgr)
-        return self._predict_frame(frame, frame_index=0, time_sec=0.0, prefix="img")
+        candidates = self._predict_frame(frame, frame_index=0, time_sec=0.0, prefix="img")
+        if progress:
+            progress({
+                "event": "detect_frame",
+                "frame_index": 0,
+                "frames_done": 1,
+                "frames_total": 1,
+                "tags_in_frame": len(candidates),
+                "tags_so_far": len(candidates),
+            })
+        return candidates
 
-    def process_video_file(self, video_path: str) -> list[CropCandidate]:
+    def process_video_file(self, video_path: str, progress=None) -> list[CropCandidate]:
         cap = cv2.VideoCapture(video_path)
         if not cap.isOpened():
             raise ValueError(f"Could not open video: {video_path}")
 
         fps = float(cap.get(cv2.CAP_PROP_FPS) or 25.0)
+        total_video_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
         frame_step = max(1, int(round(fps * self.settings.frame_interval_sec)))
+        frames_to_sample = max(1, (total_video_frames + frame_step - 1) // frame_step) if total_video_frames else 0
         tracks: dict[str, list[tuple[float, int, str, CropCandidate]]] = defaultdict(list)
         fallback: list[CropCandidate] = []
 
         frame_index = 0
+        frames_done = 0
+        tags_so_far = 0
         self.model.predictor = None
+
+        if progress:
+            progress({
+                "event": "detect_start",
+                "kind": "video",
+                "total_video_frames": total_video_frames,
+                "frames_total": frames_to_sample,
+                "fps": fps,
+            })
 
         try:
             while True:
@@ -75,6 +100,19 @@ class PriceTagDetector:
                         heapq.heappush(heap, item)
                     elif item[0] > heap[0][0]:
                         heapq.heapreplace(heap, item)
+
+                frames_done += 1
+                tags_so_far += len(candidates)
+                if progress:
+                    progress({
+                        "event": "detect_frame",
+                        "frame_index": frame_index,
+                        "frames_done": frames_done,
+                        "frames_total": frames_to_sample or frames_done,
+                        "tags_in_frame": len(candidates),
+                        "tags_so_far": tags_so_far,
+                        "unique_tracks_so_far": len(tracks),
+                    })
 
                 frame_index += 1
         finally:

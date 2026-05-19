@@ -1,14 +1,18 @@
 from __future__ import annotations
 
+import asyncio
+import json
 import os
+import queue
 import shutil
-from concurrent.futures import ThreadPoolExecutor
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextlib import asynccontextmanager
 from pathlib import Path
 
 import cv2
 from fastapi import Depends, FastAPI, File, HTTPException, UploadFile
-from fastapi.responses import JSONResponse, Response
+from fastapi.responses import JSONResponse, Response, StreamingResponse
 
 LLM_CONCURRENCY = int(os.getenv("LLM_CONCURRENCY", "4"))
 
@@ -126,6 +130,98 @@ def _llm() -> LlmClient:
     if not isinstance(llm, LlmClient):
         raise HTTPException(status_code=503, detail="LLM client is not ready")
     return llm
+
+
+@app.post("/process_stream", dependencies=[Depends(check_api_key)])
+async def process_stream(file: UploadFile = File(...), skip_llm: bool = False) -> StreamingResponse:
+    """NDJSON-stream the pipeline so clients can show real-time progress.
+
+    Events emitted (one per line, application/x-ndjson):
+      {event:"start", kind, filename}
+      {event:"detect_start", kind, frames_total, fps?, total_video_frames?}
+      {event:"detect_frame", frame_index, frames_done, frames_total, tags_in_frame, tags_so_far, unique_tracks_so_far?}
+      {event:"detected", count}                                # unique crops sent to LLM
+      {event:"llm", crop_id, done, total, ok, error?}
+      {event:"done", ok:true, count, rows:[...]}
+      {event:"error", error}
+    """
+    detector = _detector()
+    llm = _llm()
+
+    path = await persist_upload(file)
+    filename = file.filename or Path(path).name
+    content_type = file.content_type
+
+    async def gen():
+        loop = asyncio.get_running_loop()
+        events: queue.Queue = queue.Queue()
+
+        def worker() -> None:
+            try:
+                kind = media_kind(path, content_type)
+                events.put({"event": "start", "kind": kind, "filename": filename})
+
+                if kind == "image":
+                    candidates = detector.process_image(read_image_bgr(path), progress=events.put)
+                else:
+                    candidates = detector.process_video_file(path, progress=events.put)
+
+                events.put({"event": "detected", "count": len(candidates)})
+
+                total = len(candidates)
+                items: list[tuple[CropCandidate, dict]] = []
+
+                if skip_llm or total == 0:
+                    items = [(c, {"ok": True, "result": {}}) for c in candidates]
+                else:
+                    workers = max(1, min(LLM_CONCURRENCY, total))
+
+                    def call(crop: CropCandidate):
+                        try:
+                            return crop, llm.extract(crop)
+                        except Exception as exc:
+                            return crop, {"ok": False, "error": repr(exc), "result": {}}
+
+                    done_count = 0
+                    with ThreadPoolExecutor(max_workers=workers) as pool:
+                        futures = [pool.submit(call, c) for c in candidates]
+                        for fut in as_completed(futures):
+                            crop, payload = fut.result()
+                            items.append((crop, payload))
+                            done_count += 1
+                            events.put({
+                                "event": "llm",
+                                "crop_id": crop.crop_id,
+                                "done": done_count,
+                                "total": total,
+                                "ok": bool(payload.get("ok")),
+                                "error": payload.get("error"),
+                            })
+
+                rows = build_rows(filename, kind, items)
+                events.put({"event": "done", "ok": True, "count": len(rows), "rows": rows})
+            except Exception as exc:
+                events.put({"event": "error", "error": repr(exc)})
+            finally:
+                try:
+                    os.unlink(path)
+                except OSError:
+                    pass
+                events.put(None)  # sentinel
+
+        threading.Thread(target=worker, daemon=True).start()
+
+        while True:
+            ev = await loop.run_in_executor(None, events.get)
+            if ev is None:
+                break
+            yield (json.dumps(ev, ensure_ascii=False) + "\n").encode("utf-8")
+
+    return StreamingResponse(
+        gen(),
+        media_type="application/x-ndjson",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
 
 
 def _run_llm_parallel(

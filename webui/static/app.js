@@ -92,28 +92,79 @@ csvBtn.addEventListener("click", () => downloadCSV());
 async function process() {
   if (!currentFile) return;
   goBtn.disabled = true; csvBtn.disabled = true;
-  statusEl.innerHTML = '<span class="spinner"></span>processing…';
+  statusEl.innerHTML = '<span class="spinner"></span>отправка…';
   statusEl.className = "status";
+  lastRows = null;
+  resultsEl.hidden = true;
 
   const fd = new FormData();
   fd.append("file", currentFile);
   const t0 = performance.now();
+
+  let llmOk = 0, llmErr = 0;
+
+  const handle = (ev) => {
+    if (ev.event === "start") {
+      const kind = ev.kind === "video" ? "видео" : "кадра";
+      statusEl.innerHTML = `<span class="spinner"></span>анализ ${kind}…`;
+    } else if (ev.event === "detect_start") {
+      const total = ev.frames_total || 1;
+      const extra = ev.total_video_frames ? ` (из ${ev.total_video_frames} кадров)` : "";
+      statusEl.innerHTML = `<span class="spinner"></span>детекция: сэмплируем ${total} кадров${extra}…`;
+    } else if (ev.event === "detect_frame") {
+      const total = ev.frames_total || ev.frames_done;
+      const tracks = ev.unique_tracks_so_far != null ? `, треков: ${ev.unique_tracks_so_far}` : "";
+      statusEl.innerHTML = `<span class="spinner"></span>детекция ${ev.frames_done}/${total} · найдено ценников: ${ev.tags_so_far}${tracks}`;
+    } else if (ev.event === "detected") {
+      statusEl.innerHTML = `<span class="spinner"></span>найдено уникальных ценников: ${ev.count}. Отправляю в LLM…`;
+      llmOk = 0; llmErr = 0;
+    } else if (ev.event === "llm") {
+      if (ev.ok) llmOk++; else llmErr++;
+      const errPart = llmErr ? `, ошибок: ${llmErr}` : "";
+      statusEl.innerHTML = `<span class="spinner"></span>LLM ${ev.done}/${ev.total} · ok: ${llmOk}${errPart}`;
+    } else if (ev.event === "done") {
+      lastRows = ev.rows || [];
+      const dt = ((performance.now() - t0) / 1000).toFixed(1);
+      statusEl.textContent = `✓ готово · ${lastRows.length} ценников · ${dt}s`;
+      statusEl.className = "status ok";
+      countEl.textContent = `(${lastRows.length})`;
+    } else if (ev.event === "error") {
+      statusEl.textContent = `error: ${ev.error}`;
+      statusEl.className = "status err";
+    }
+  };
+
   try {
     const r = await fetch("/api/process", { method: "POST", body: fd });
-    const j = await r.json();
-    const dt = ((performance.now() - t0) / 1000).toFixed(1);
-    if (!r.ok || !j.ok) {
-      statusEl.textContent = `error: ${j.detail || j.error || r.statusText}`;
+    if (!r.ok || !r.body) {
+      statusEl.textContent = `error: ${r.statusText}`;
       statusEl.className = "status err";
       return;
     }
-    lastRows = j.rows || [];
-    statusEl.textContent = `ok · ${lastRows.length} ценников · ${dt}s`;
-    statusEl.className = "status ok";
-    countEl.textContent = `(${lastRows.length})`;
-    await render();
-    resultsEl.hidden = false;
-    csvBtn.disabled = lastRows.length === 0;
+    const reader = r.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = "";
+    while (true) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      buffer += decoder.decode(value, { stream: true });
+      let nl;
+      while ((nl = buffer.indexOf("\n")) >= 0) {
+        const line = buffer.slice(0, nl).trim();
+        buffer = buffer.slice(nl + 1);
+        if (!line) continue;
+        try { handle(JSON.parse(line)); } catch (e) { console.warn("bad ndjson:", line); }
+      }
+    }
+    if (buffer.trim()) {
+      try { handle(JSON.parse(buffer.trim())); } catch (_) {}
+    }
+
+    if (lastRows) {
+      await render();
+      resultsEl.hidden = false;
+      csvBtn.disabled = lastRows.length === 0;
+    }
   } catch (e) {
     statusEl.textContent = `error: ${e.message}`;
     statusEl.className = "status err";
