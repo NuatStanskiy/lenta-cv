@@ -1,0 +1,54 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Price-tag pipeline — UI</title>
+  <link rel="stylesheet" href="/style.css">
+</head>
+<body>
+  <header>
+    <h1>Price-tag pipeline</h1>
+    <div id="health" class="health">pipeline: …</div>
+  </header>
+
+  <main>
+    <section class="upload">
+      <div id="drop" class="drop">
+        <input id="file" type="file" accept="image/*,video/*" hidden>
+        <p>Перетащите фото или видео сюда<br>или <button id="pick" type="button">выберите файл</button></p>
+        <p class="hint">image/* или video/* (mp4/mov). Большое видео обрабатывается несколько минут.</p>
+        <p id="picked" class="picked"></p>
+      </div>
+
+      <div class="actions">
+        <button id="go" type="button" disabled>Обработать</button>
+        <button id="csv" type="button" disabled>Скачать CSV</button>
+        <span id="status" class="status"></span>
+      </div>
+    </section>
+
+    <section id="results" class="results" hidden>
+      <div class="preview">
+        <h2>Превью</h2>
+        <div class="canvas-wrap">
+          <canvas id="canvas"></canvas>
+        </div>
+        <p class="hint">Зелёная рамка — llm_ok, красная — ошибка LLM. Над рамкой — индекс и price_card.</p>
+      </div>
+
+      <div class="table-wrap">
+        <h2>Извлечённые данные <span id="count" class="count"></span></h2>
+        <div class="overflow">
+          <table id="rows">
+            <thead></thead>
+            <tbody></tbody>
+          </table>
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <script src="/app.js"></script>
+</body>
+</html>

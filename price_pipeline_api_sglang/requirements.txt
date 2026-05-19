@@ -1,0 +1,10 @@
+fastapi==0.115.8
+uvicorn[standard]==0.34.0
+python-multipart==0.0.20
+pydantic-settings==2.7.1
+requests==2.32.3
+numpy==1.26.4
+opencv-python-headless==4.10.0.84
+pandas==2.2.3
+ultralytics==8.3.72
+lap>=0.5.12

@@ -1,0 +1,18 @@
+services:
+  webui:
+    build: .
+    image: price-pipeline-webui
+    container_name: price-pipeline-webui
+    ports:
+      - "8080:8080"
+    environment:
+      # URL пайплайна, виден ИЗ КОНТЕЙНЕРА webui.
+      # Если на сервере поднят reverse-SSH-туннель в твою локалку → http://host.docker.internal:7860
+      # Если pipeline крутится рядом в той же сети Docker → http://price-pipeline:7860
+      PIPELINE_API_URL: ${PIPELINE_API_URL:-http://host.docker.internal:7860}
+      PIPELINE_API_KEY: ${PIPELINE_API_KEY:-}
+      REQUEST_TIMEOUT: ${REQUEST_TIMEOUT:-1800}
+    # нужно если PIPELINE_API_URL использует host.docker.internal на Linux
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    restart: unless-stopped
