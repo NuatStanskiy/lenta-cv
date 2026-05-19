@@ -18,6 +18,18 @@ const LLM_FIELDS = [
   "id_sku", "print_datetime", "code", "additional_info",
 ];
 
+// Full target CSV schema — same column order as csv_writer.FIELDNAMES on the pipeline.
+const CSV_FIELDS = [
+  "filename", "product_name", "price_default", "price_card", "price_discount",
+  "barcode", "discount_amount", "id_sku", "print_datetime", "code",
+  "additional_info", "color", "special_symbols", "frame_timestamp",
+  "x_min", "y_min", "x_max", "y_max",
+  "qr_code_barcode", "price1_qr", "price2_qr", "price3_qr", "price4_qr",
+  "wholesale_level_1_count", "wholesale_level_1_price",
+  "wholesale_level_2_count", "wholesale_level_2_price",
+  "action_price_qr", "action_code_qr",
+];
+
 let currentFile = null;
 let previewURL = null;
 let lastRows = null;
@@ -64,7 +76,8 @@ function setFile(f) {
   currentFile = f;
   pickedEl.textContent = `${f.name} · ${(f.size / 1024 / 1024).toFixed(1)} MB · ${f.type || "?"}`;
   goBtn.disabled = false;
-  csvBtn.disabled = false;
+  csvBtn.disabled = true; // until /api/process succeeds we have nothing to download
+  lastRows = null;
   if (previewURL) URL.revokeObjectURL(previewURL);
   previewURL = URL.createObjectURL(f);
   resultsEl.hidden = true;
@@ -100,44 +113,46 @@ async function process() {
     countEl.textContent = `(${lastRows.length})`;
     await render();
     resultsEl.hidden = false;
+    csvBtn.disabled = lastRows.length === 0;
   } catch (e) {
     statusEl.textContent = `error: ${e.message}`;
     statusEl.className = "status err";
   } finally {
-    goBtn.disabled = false; csvBtn.disabled = false;
+    goBtn.disabled = false;
   }
 }
 
-async function downloadCSV() {
-  if (!currentFile) return;
-  csvBtn.disabled = true;
-  statusEl.innerHTML = '<span class="spinner"></span>downloading CSV…';
-  statusEl.className = "status";
-  const fd = new FormData();
-  fd.append("file", currentFile);
-  try {
-    const r = await fetch("/api/process_csv", { method: "POST", body: fd });
-    if (!r.ok) {
-      statusEl.textContent = `error: ${r.statusText}`;
-      statusEl.className = "status err";
-      return;
-    }
-    const blob = await r.blob();
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement("a");
-    a.href = url;
-    const stem = currentFile.name.replace(/\.[^.]+$/, "");
-    a.download = `${stem}.csv`;
-    a.click();
-    URL.revokeObjectURL(url);
-    statusEl.textContent = "csv saved";
-    statusEl.className = "status ok";
-  } catch (e) {
-    statusEl.textContent = `error: ${e.message}`;
-    statusEl.className = "status err";
-  } finally {
-    csvBtn.disabled = false;
+function csvEscape(v) {
+  if (v == null || v === "") return "Нет";
+  const s = String(v);
+  return /[",\r\n]/.test(s) ? '"' + s.replaceAll('"', '""') + '"' : s;
+}
+
+function buildCSV(rows) {
+  const lines = [CSV_FIELDS.join(",")];
+  for (const r of rows) {
+    lines.push(CSV_FIELDS.map((f) => csvEscape(r[f])).join(","));
   }
+  return "\uFEFF" + lines.join("\r\n") + "\r\n";
+}
+
+function downloadCSV() {
+  if (!lastRows || !lastRows.length) {
+    statusEl.textContent = "сначала нажми «Обработать»";
+    statusEl.className = "status err";
+    return;
+  }
+  const csv = buildCSV(lastRows);
+  const blob = new Blob([csv], { type: "text/csv;charset=utf-8" });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  const stem = (currentFile?.name || "result").replace(/\.[^.]+$/, "");
+  a.download = `${stem}.csv`;
+  a.click();
+  URL.revokeObjectURL(url);
+  statusEl.textContent = `csv saved (${lastRows.length} строк)`;
+  statusEl.className = "status ok";
 }
 
 // ── rendering ────────────────────────────────────────────────────────────
