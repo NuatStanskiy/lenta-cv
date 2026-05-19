@@ -7,6 +7,7 @@ ENV:
 """
 from __future__ import annotations
 
+import asyncio
 import os
 from pathlib import Path
 
@@ -18,6 +19,8 @@ from fastapi.staticfiles import StaticFiles
 PIPELINE_URL = os.getenv("PIPELINE_API_URL", "http://localhost:7860").rstrip("/")
 PIPELINE_KEY = os.getenv("PIPELINE_API_KEY") or ""
 TIMEOUT = float(os.getenv("REQUEST_TIMEOUT", "1800"))
+RETRY_DELAY = float(os.getenv("RETRY_DELAY", "3"))
+TRANSIENT_ERRORS = (httpx.ConnectError, httpx.ReadError, httpx.RemoteProtocolError)
 
 app = FastAPI(title="Price-tag pipeline UI")
 
@@ -44,9 +47,21 @@ async def health() -> JSONResponse:
 
 async def _forward(endpoint: str, file: UploadFile) -> httpx.Response:
     payload = await file.read()
-    files = {"file": (file.filename or "upload.bin", payload, file.content_type or "application/octet-stream")}
+    fname = file.filename or "upload.bin"
+    ctype = file.content_type or "application/octet-stream"
     async with httpx.AsyncClient(timeout=TIMEOUT) as c:
-        return await c.post(f"{PIPELINE_URL}{endpoint}", files=files, headers=_headers())
+        for attempt in (0, 1):
+            try:
+                return await c.post(
+                    f"{PIPELINE_URL}{endpoint}",
+                    files={"file": (fname, payload, ctype)},
+                    headers=_headers(),
+                )
+            except TRANSIENT_ERRORS:
+                if attempt == 1:
+                    raise
+                await asyncio.sleep(RETRY_DELAY)
+    raise RuntimeError("unreachable")  # for type-checkers
 
 
 @app.post("/api/process")
