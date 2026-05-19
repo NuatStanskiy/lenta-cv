@@ -49,6 +49,7 @@ def health() -> dict[str, object]:
         "llm_backend": settings.llm_backend,
         "llm_model": settings.llm_model,
         "device": settings.device,
+        "rotate": settings.rotate,
     }
 
 

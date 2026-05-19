@@ -21,6 +21,7 @@ const LLM_FIELDS = [
 let currentFile = null;
 let previewURL = null;
 let lastRows = null;
+let pipelineRotate = "none"; // updated from /api/health
 
 // ── health ───────────────────────────────────────────────────────────────
 async function checkHealth() {
@@ -28,7 +29,8 @@ async function checkHealth() {
     const r = await fetch("/api/health");
     const j = await r.json();
     if (j.ok && j.pipeline && j.pipeline.detector_ready) {
-      healthEl.textContent = `pipeline ok · ${j.pipeline_url}`;
+      pipelineRotate = j.pipeline.rotate || "none";
+      healthEl.textContent = `pipeline ok · rotate=${pipelineRotate}`;
       healthEl.className = "health ok";
     } else {
       healthEl.textContent = `pipeline: ${j.error || "not ready"}`;
@@ -109,7 +111,6 @@ async function process() {
 async function downloadCSV() {
   if (!currentFile) return;
   csvBtn.disabled = true;
-  const prev = statusEl.innerHTML;
   statusEl.innerHTML = '<span class="spinner"></span>downloading CSV…';
   statusEl.className = "status";
   const fd = new FormData();
@@ -145,42 +146,61 @@ async function render() {
   renderTable();
 }
 
+// Pick effective rotation by comparing bbox aspect to bitmap aspect.
+// Browsers auto-rotate images/videos via EXIF/mp4-orientation, OpenCV usually doesn't —
+// so even with pipelineRotate=ccw the displayed bitmap may already match bbox coords.
+function effectiveRotation(bitmap, rows, pipelineRot) {
+  if (!rows || !rows.length) return "none";
+  const maxX = Math.max(...rows.map((r) => r.x_max));
+  const maxY = Math.max(...rows.map((r) => r.y_max));
+  if (!maxX || !maxY) return "none";
+  const aspBbox = maxX / maxY;
+  const aspBitmap = bitmap.width / bitmap.height;
+  // aspects roughly equal → bbox already in displayed coord system, no transform
+  if (Math.abs(aspBbox - aspBitmap) / Math.max(aspBbox, aspBitmap) < 0.15) return "none";
+  // otherwise apply pipeline-side rotation inverse
+  return pipelineRot || "ccw";
+}
+
+function mapBbox(r, rot, W, H) {
+  // r contains x_min, y_min, x_max, y_max IN the pipeline-processed (post-rotate) frame.
+  // We want canvas coords on a bitmap drawn in its NATURAL orientation (size W × H).
+  if (rot === "ccw") {
+    return { x: W - r.y_max, y: r.x_min, w: r.y_max - r.y_min, h: r.x_max - r.x_min };
+  }
+  if (rot === "cw") {
+    return { x: r.y_min, y: H - r.x_max, w: r.y_max - r.y_min, h: r.x_max - r.x_min };
+  }
+  if (rot === "180") {
+    return { x: W - r.x_max, y: H - r.y_max, w: r.x_max - r.x_min, h: r.y_max - r.y_min };
+  }
+  return { x: r.x_min, y: r.y_min, w: r.x_max - r.x_min, h: r.y_max - r.y_min };
+}
+
 async function renderPreview() {
   const isVideo = (currentFile.type || "").startsWith("video/");
   const ctx = canvas.getContext("2d");
 
-  let bitmap;
-  if (isVideo) {
-    bitmap = await frameFromVideo(previewURL);
-  } else {
-    bitmap = await loadImageBitmap(previewURL);
-  }
-
-  // Pipeline rotates CCW (90°), so width/height swap when comparing bbox to source.
-  // bbox is in rotated coordinates: x ∈ [0, original_h], y ∈ [0, original_w]
-  // We rotate the preview canvas to match the rotated frame the pipeline saw.
-  const rotW = bitmap.height;
-  const rotH = bitmap.width;
-  canvas.width = rotW;
-  canvas.height = rotH;
-  ctx.save();
-  ctx.translate(0, rotH);
-  ctx.rotate(-Math.PI / 2);
+  const bitmap = isVideo ? await frameFromVideo(previewURL) : await loadImageBitmap(previewURL);
+  const W = bitmap.width;
+  const H = bitmap.height;
+  canvas.width = W;
+  canvas.height = H;
   ctx.drawImage(bitmap, 0, 0);
-  ctx.restore();
 
   if (!lastRows) return;
-  ctx.lineWidth = Math.max(3, Math.round(rotW / 600));
-  ctx.font = `${Math.max(16, Math.round(rotW / 60))}px sans-serif`;
+  const rot = effectiveRotation(bitmap, lastRows, pipelineRotate);
+
+  ctx.lineWidth = Math.max(3, Math.round(W / 600));
+  ctx.font = `${Math.max(16, Math.round(W / 60))}px sans-serif`;
   ctx.textBaseline = "bottom";
   lastRows.forEach((r, i) => {
     const ok = !!r._llm_ok;
     ctx.strokeStyle = ok ? "#22c55e" : "#ef4444";
     ctx.fillStyle = ok ? "#22c55e" : "#ef4444";
-    const x = r.x_min, y = r.y_min, w = r.x_max - r.x_min, h = r.y_max - r.y_min;
-    ctx.strokeRect(x, y, w, h);
-    const label = `#${i} ${r.price_card}`;
-    ctx.fillText(label, x, y - 4);
+    const b = mapBbox(r, rot, W, H);
+    ctx.strokeRect(b.x, b.y, b.w, b.h);
+    ctx.fillText(`#${i} ${r.price_card}`, b.x, b.y - 4);
   });
 }
 
@@ -200,7 +220,6 @@ function frameFromVideo(url) {
     v.muted = true;
     v.src = url;
     v.addEventListener("loadeddata", () => {
-      // seek to mid-frame for a representative shot
       v.currentTime = Math.min(v.duration * 0.5, 5);
     }, { once: true });
     v.addEventListener("seeked", () => {
@@ -219,7 +238,6 @@ function frameFromVideo(url) {
 function renderTable() {
   thead.innerHTML = "";
   tbody.innerHTML = "";
-
   const cols = ["#", ...LLM_FIELDS];
   const trh = document.createElement("tr");
   cols.forEach((c) => {
@@ -256,7 +274,6 @@ function highlight(idx, on) {
   document.querySelectorAll("#rows tbody tr").forEach((tr) => tr.classList.remove("hl"));
   if (!on || !lastRows) return renderPreview();
   document.querySelector(`#rows tbody tr[data-idx="${idx}"]`)?.classList.add("hl");
-  // re-render preview emphasising this row
   renderPreviewHighlight(idx);
 }
 
@@ -265,7 +282,9 @@ async function renderPreviewHighlight(highlightIdx) {
   const ctx = canvas.getContext("2d");
   const r = lastRows[highlightIdx];
   if (!r) return;
+  const rot = effectiveRotation({ width: canvas.width, height: canvas.height }, lastRows, pipelineRotate);
+  const b = mapBbox(r, rot, canvas.width, canvas.height);
   ctx.lineWidth = Math.max(8, Math.round(canvas.width / 250));
   ctx.strokeStyle = "#fbbf24";
-  ctx.strokeRect(r.x_min, r.y_min, r.x_max - r.x_min, r.y_max - r.y_min);
+  ctx.strokeRect(b.x, b.y, b.w, b.h);
 }
